@@ -1,9 +1,10 @@
 # coding: utf-8
 
 """
-Wrapper for LivePortrait core functions
+Wrappers for LivePortrait core functions
 """
 
+import contextlib
 import os.path as osp
 import numpy as np
 import cv2
@@ -19,39 +20,60 @@ from .utils.rprint import rlog as log
 
 
 class LivePortraitWrapper(object):
+    """
+    Wrapper for Human
+    """
 
     def __init__(self, inference_cfg: InferenceConfig):
 
         self.inference_cfg = inference_cfg
         self.device_id = inference_cfg.device_id
+        self.compile = inference_cfg.flag_do_torch_compile
         if inference_cfg.flag_force_cpu:
             self.device = 'cpu'
         else:
-            self.device = 'cuda:' + str(self.device_id)
+            try:
+                if torch.backends.mps.is_available():
+                    self.device = 'mps'
+                else:
+                    self.device = 'cuda:' + str(self.device_id)
+            except:
+                self.device = 'cuda:' + str(self.device_id)
 
         model_config = yaml.load(open(inference_cfg.models_config, 'r'), Loader=yaml.SafeLoader)
         # init F
         self.appearance_feature_extractor = load_model(inference_cfg.checkpoint_F, model_config, self.device, 'appearance_feature_extractor')
-        log(f'Load appearance_feature_extractor done.')
+        log(f'Load appearance_feature_extractor from {osp.realpath(inference_cfg.checkpoint_F)} done.')
         # init M
         self.motion_extractor = load_model(inference_cfg.checkpoint_M, model_config, self.device, 'motion_extractor')
-        log(f'Load motion_extractor done.')
+        log(f'Load motion_extractor from {osp.realpath(inference_cfg.checkpoint_M)} done.')
         # init W
         self.warping_module = load_model(inference_cfg.checkpoint_W, model_config, self.device, 'warping_module')
-        log(f'Load warping_module done.')
+        log(f'Load warping_module from {osp.realpath(inference_cfg.checkpoint_W)} done.')
         # init G
         self.spade_generator = load_model(inference_cfg.checkpoint_G, model_config, self.device, 'spade_generator')
-        log(f'Load spade_generator done.')
+        log(f'Load spade_generator from {osp.realpath(inference_cfg.checkpoint_G)} done.')
         # init S and R
         if inference_cfg.checkpoint_S is not None and osp.exists(inference_cfg.checkpoint_S):
             self.stitching_retargeting_module = load_model(inference_cfg.checkpoint_S, model_config, self.device, 'stitching_retargeting_module')
-            log(f'Load stitching_retargeting_module done.')
+            log(f'Load stitching_retargeting_module from {osp.realpath(inference_cfg.checkpoint_S)} done.')
         else:
             self.stitching_retargeting_module = None
+        # Optimize for inference
+        if self.compile:
+            torch._dynamo.config.suppress_errors = True  # Suppress errors and fall back to eager execution
+            self.warping_module = torch.compile(self.warping_module, mode='max-autotune')
+            self.spade_generator = torch.compile(self.spade_generator, mode='max-autotune')
 
-        
-        
         self.timer = Timer()
+
+    def inference_ctx(self):
+        if self.device == "mps":
+            ctx = contextlib.nullcontext()
+        else:
+            ctx = torch.autocast(device_type=self.device[:4], dtype=torch.float16,
+                                 enabled=self.inference_cfg.flag_use_half_precision)
+        return ctx
 
     def update_config(self, user_args):
         for k, v in user_args.items():
@@ -79,7 +101,7 @@ class LivePortraitWrapper(object):
         x = x.to(self.device)
         return x
 
-    def prepare_driving_videos(self, imgs) -> torch.Tensor:
+    def prepare_videos(self, imgs) -> torch.Tensor:
         """ construct the input as standard
         imgs: NxBxHxWx3, uint8
         """
@@ -101,9 +123,8 @@ class LivePortraitWrapper(object):
         """ get the appearance feature of the image by F
         x: Bx3xHxW, normalized to 0~1
         """
-        with torch.no_grad():
-            with torch.autocast(device_type=self.device[:4], dtype=torch.float16, enabled=self.inference_cfg.flag_use_half_precision):
-                feature_3d = self.appearance_feature_extractor(x)
+        with torch.no_grad(), self.inference_ctx():
+            feature_3d = self.appearance_feature_extractor(x)
 
         return feature_3d.float()
 
@@ -113,9 +134,8 @@ class LivePortraitWrapper(object):
         flag_refine_info: whether to trandform the pose to degrees and the dimention of the reshape
         return: A dict contains keys: 'pitch', 'yaw', 'roll', 't', 'exp', 'scale', 'kp'
         """
-        with torch.no_grad():
-            with torch.autocast(device_type=self.device[:4], dtype=torch.float16, enabled=self.inference_cfg.flag_use_half_precision):
-                kp_info = self.motion_extractor(x)
+        with torch.no_grad(), self.inference_ctx():
+            kp_info = self.motion_extractor(x)
 
             if self.inference_cfg.flag_use_half_precision:
                 # float the dict
@@ -195,26 +215,27 @@ class LivePortraitWrapper(object):
         """
         kp_source: BxNx3
         eye_close_ratio: Bx3
-        Return: Bx(3*num_kp+2)
+        Return: Bx(3*num_kp)
         """
         feat_eye = concat_feat(kp_source, eye_close_ratio)
 
         with torch.no_grad():
             delta = self.stitching_retargeting_module['eye'](feat_eye)
 
-        return delta
+        return delta.reshape(-1, kp_source.shape[1], 3)
 
     def retarget_lip(self, kp_source: torch.Tensor, lip_close_ratio: torch.Tensor) -> torch.Tensor:
         """
         kp_source: BxNx3
         lip_close_ratio: Bx2
+        Return: Bx(3*num_kp)
         """
         feat_lip = concat_feat(kp_source, lip_close_ratio)
 
         with torch.no_grad():
             delta = self.stitching_retargeting_module['lip'](feat_lip)
 
-        return delta
+        return delta.reshape(-1, kp_source.shape[1], 3)
 
     def stitch(self, kp_source: torch.Tensor, kp_driving: torch.Tensor) -> torch.Tensor:
         """
@@ -259,12 +280,14 @@ class LivePortraitWrapper(object):
         kp_driving: BxNx3
         """
         # The line 18 in Algorithm 1: D(W(f_s; x_s, x′_d,i)）
-        with torch.no_grad():
-            with torch.autocast(device_type=self.device[:4], dtype=torch.float16, enabled=self.inference_cfg.flag_use_half_precision):
-                # get decoder input
-                ret_dct = self.warping_module(feature_3d, kp_source=kp_source, kp_driving=kp_driving)
-                # decode
-                ret_dct['out'] = self.spade_generator(feature=ret_dct['out'])
+        with torch.no_grad(), self.inference_ctx():
+            if self.compile:
+                # Mark the beginning of a new CUDA Graph step
+                torch.compiler.cudagraph_mark_step_begin()
+            # get decoder input
+            ret_dct = self.warping_module(feature_3d, kp_source=kp_source, kp_driving=kp_driving)
+            # decode
+            ret_dct['out'] = self.spade_generator(feature=ret_dct['out'])
 
             # float the dict
             if self.inference_cfg.flag_use_half_precision:
@@ -284,10 +307,10 @@ class LivePortraitWrapper(object):
 
         return out
 
-    def calc_driving_ratio(self, driving_lmk_lst):
+    def calc_ratio(self, lmk_lst):
         input_eye_ratio_lst = []
         input_lip_ratio_lst = []
-        for lmk in driving_lmk_lst:
+        for lmk in lmk_lst:
             # for eyes retargeting
             input_eye_ratio_lst.append(calc_eye_close_ratio(lmk[None]))
             # for lip retargeting
@@ -309,3 +332,53 @@ class LivePortraitWrapper(object):
         # [c_s,lip, c_d,lip,i]
         combined_lip_ratio_tensor = torch.cat([c_s_lip_tensor, c_d_lip_i_tensor], dim=1) # 1x2
         return combined_lip_ratio_tensor
+
+
+class LivePortraitWrapperAnimal(LivePortraitWrapper):
+    """
+    Wrapper for Animal
+    """
+    def __init__(self, inference_cfg: InferenceConfig):
+        # super().__init__(inference_cfg)  # 调用父类的初始化方法
+
+        self.inference_cfg = inference_cfg
+        self.device_id = inference_cfg.device_id
+        self.compile = inference_cfg.flag_do_torch_compile
+        if inference_cfg.flag_force_cpu:
+            self.device = 'cpu'
+        else:
+            try: 
+                if torch.backends.mps.is_available():
+                    self.device = 'mps'
+                else:
+                    self.device = 'cuda:' + str(self.device_id)
+            except:
+                    self.device = 'cuda:' + str(self.device_id)
+
+        model_config = yaml.load(open(inference_cfg.models_config, 'r'), Loader=yaml.SafeLoader)
+        # init F
+        self.appearance_feature_extractor = load_model(inference_cfg.checkpoint_F_animal, model_config, self.device, 'appearance_feature_extractor')
+        log(f'Load appearance_feature_extractor from {osp.realpath(inference_cfg.checkpoint_F_animal)} done.')
+        # init M
+        self.motion_extractor = load_model(inference_cfg.checkpoint_M_animal, model_config, self.device, 'motion_extractor')
+        log(f'Load motion_extractor from {osp.realpath(inference_cfg.checkpoint_M_animal)} done.')
+        # init W
+        self.warping_module = load_model(inference_cfg.checkpoint_W_animal, model_config, self.device, 'warping_module')
+        log(f'Load warping_module from {osp.realpath(inference_cfg.checkpoint_W_animal)} done.')
+        # init G
+        self.spade_generator = load_model(inference_cfg.checkpoint_G_animal, model_config, self.device, 'spade_generator')
+        log(f'Load spade_generator from {osp.realpath(inference_cfg.checkpoint_G_animal)} done.')
+        # init S and R
+        if inference_cfg.checkpoint_S_animal is not None and osp.exists(inference_cfg.checkpoint_S_animal):
+            self.stitching_retargeting_module = load_model(inference_cfg.checkpoint_S_animal, model_config, self.device, 'stitching_retargeting_module')
+            log(f'Load stitching_retargeting_module from {osp.realpath(inference_cfg.checkpoint_S_animal)} done.')
+        else:
+            self.stitching_retargeting_module = None
+
+        # Optimize for inference
+        if self.compile:
+            torch._dynamo.config.suppress_errors = True  # Suppress errors and fall back to eager execution
+            self.warping_module = torch.compile(self.warping_module, mode='max-autotune')
+            self.spade_generator = torch.compile(self.spade_generator, mode='max-autotune')
+
+        self.timer = Timer()
